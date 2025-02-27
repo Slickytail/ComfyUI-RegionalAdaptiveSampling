@@ -94,6 +94,11 @@ class RASManager:
             self.timestep = self.timestep_from_sigmas(
                 transformer_options["sigmas"], transformer_options["sample_sigmas"]
             )
+            if self.timestep == 0:
+                # reset as much as possible
+                self.live_img_indices = None
+                self.live_txt_indices = None
+                self.drop_count = None
             return forward_orig(*args, **kwargs)
 
         model.forward_orig = MethodType(new_forward, model)
