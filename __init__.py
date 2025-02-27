@@ -22,7 +22,8 @@ class RegionalAdaptiveSampling:
         model = model.clone()
         config = RASConfig(sample_ratio=sample_ratio)
         manager = RASManager(config)
-        manager.wrap_model(model.diffusion_model)
+        # todo: improve this, because this is a godawful way to go about it
+        manager.wrap_model(model.model.diffusion_model)
         return (model,)
 
 

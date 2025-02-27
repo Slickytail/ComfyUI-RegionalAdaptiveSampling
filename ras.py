@@ -1,14 +1,12 @@
-from uuid import uuid4 as uuid
 from dataclasses import dataclass
 from types import MethodType
-from typing import overload
+from time import sleep
 
 import torch
 from torch import nn
 from torch import Tensor
 from einops import rearrange
 
-import comfy.ldm.common_dit
 from comfy.ldm.flux.model import Flux
 from comfy.ldm.hunyuan_video.model import HunyuanVideo
 from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock, LastLayer
@@ -30,7 +28,7 @@ def apply_pe(x: Tensor, pe: Tensor) -> Tensor:
 @dataclass
 class RASConfig:
     start_step: int = 4
-    hydrate_steps: list[int] = [8, 12, 16]
+    hydrate_every: int = 5
     sample_ratio: float = 0.5
     starvation_scale: float = 0.1
     high_ratio: float = 1.0
@@ -42,6 +40,7 @@ class RASManager:
     """
 
     def __init__(self, config: RASConfig):
+        self.flipped_img_txt = False
         self.timestep: int = 0
         self.n_txt: int = 0
         self.n_img: int = 0
@@ -79,18 +78,23 @@ class RASManager:
             raise TypeError(f"Can't wrap model of type {model.__class__.__name__}")
         # wrap the single and double blocks to have caching
         for i, v in enumerate(model.double_blocks):
-            model.double_blocks[i] = self.wrap_layer(v, i == 0)
+            if i == 0:
+                self.flipped_img_txt = v.flipped_img_txt
+                model.double_blocks[i] = self.wrap_layer(v, first=True)
+            else:
+                model.double_blocks[i] = self.wrap_layer(v)
         for i, v in enumerate(model.single_blocks):
             model.single_blocks[i] = self.wrap_layer(v)
 
         # wrap the forward_orig method, to be able to get the timestep
         forward_orig = model.forward_orig
 
-        def new_forward(_self, *args, transformer_options={}, **kwargs):
-            self.timestep = self.timestep_from_sigmas(**transformer_options)
-            return forward_orig(
-                *args, transformer_options=transformer_options, **kwargs
+        def new_forward(_self, *args, **kwargs):
+            transformer_options = args[-1]
+            self.timestep = self.timestep_from_sigmas(
+                transformer_options["sigmas"], transformer_options["sample_sigmas"]
             )
+            return forward_orig(*args, **kwargs)
 
         model.forward_orig = MethodType(new_forward, model)
 
@@ -98,7 +102,7 @@ class RASManager:
         model.final_layer = self.wrap_layer(model.final_layer)
 
     @staticmethod
-    def timestep_from_sigmas(sigmas: Tensor, sample_sigmas: Tensor, **_):
+    def timestep_from_sigmas(sigmas: Tensor, sample_sigmas: Tensor):
         # we assume that one element of sample_sigmas is exactly equal to sigmas
         # but we'll still check explicitly, using an argmin, in case of some loss of precision
         s = sigmas.item()
@@ -106,7 +110,9 @@ class RASManager:
         return int(i.item())
 
     def skip_ratio(self, timestep: int) -> float:
-        if timestep < self.config.start_step or timestep in self.config.hydrate_steps:
+        if timestep < self.config.start_step or (
+            timestep % self.config.hydrate_every == 0
+        ):
             return 1
         return 1.0 - self.config.sample_ratio
 
@@ -136,7 +142,9 @@ class RASManager:
         # that might be a problem
         metric = metric.flatten()
         if self.drop_count is None:
-            self.drop_count = torch.zeros(metric.shape, dtype=torch.int)
+            self.drop_count = torch.zeros(
+                metric.shape, dtype=torch.int, device=diff.device
+            )
         # hmm, what if we do a gaussian blur or some sort of spatial lowpass, to improve the spatial continuity of the patches?
         metric *= torch.exp(self.config.starvation_scale * self.drop_count)
         indices = torch.sort(metric, dim=-1, descending=False).indices
@@ -145,19 +153,22 @@ class RASManager:
             # we're not dropping anything -- remove the live_indices
             # we use the value None to indicate a full hydrate
             self.live_img_indices = None
-        low_bar = int(skip_ratio * len(metric) * (1 - self.config.high_ratio))
-        high_bar = int(skip_ratio * len(metric) * self.config.high_ratio)
-        cache_indices = torch.cat([indices[:low_bar], indices[-high_bar:]])
-        self.live_img_indices = indices[low_bar:-high_bar]
+        else:
+            low_bar = int(skip_ratio * len(metric) * (1 - self.config.high_ratio))
+            high_bar = int(skip_ratio * len(metric) * self.config.high_ratio)
+            cache_indices = torch.cat([indices[:low_bar], indices[-high_bar:]])
+            self.live_img_indices = indices[low_bar:-high_bar]
+            self.drop_count[cache_indices] += 1
         # TODO: for now we keep all txt tokens
         # in the future, we can probably do something like randomly keep a fraction of them
-        self.live_txt_indices = torch.arange(0, self.n_txt, dtype=torch.int)
-        self.drop_count[cache_indices] += 1
+        self.live_txt_indices = torch.arange(
+            0, self.n_txt, dtype=torch.int, device=diff.device
+        )
 
-    def live_indices(self, reversed=False):
+    def live_indices(self):
         if self.live_img_indices is None or self.live_txt_indices is None:
             return None
-        if reversed:
+        if self.flipped_img_txt:
             return torch.cat(
                 (self.live_img_indices, self.live_txt_indices + self.n_img)
             )
@@ -167,12 +178,13 @@ class RASManager:
             )
 
 
-class LastLayerWrapper(LastLayer):
+class LastLayerWrapper(nn.Module):
     """
     Same as the LastLayer, but reports its output to a manager.
     """
 
     def __init__(self, original: LastLayer, manager: RASManager):
+        super().__init__()
         self.original = original
         self.manager = manager
 
@@ -194,6 +206,7 @@ class DoubleStreamBlockWrapper(nn.Module):
     """
 
     def __init__(self, original: DoubleStreamBlock, manager: RASManager, first=False):
+        super().__init__()
         self.block = original
         self.manager = manager
         self.k_cache: torch.Tensor
@@ -201,14 +214,15 @@ class DoubleStreamBlockWrapper(nn.Module):
         self.first = first
 
     def forward(self, img, txt, vec, pe, attn_mask=None):
-        # if this is the first doublestreamblock, then we should drop some of the img and txt tokens
+        # RAS: if this is the first doublestreamblock, then we should drop some of the img and txt tokens
+        idx = self.manager.live_indices()
         if self.first:
             self.manager.n_txt = txt.shape[1]
             self.manager.n_img = img.shape[1]
 
             img_idx = self.manager.live_img_indices
             txt_idx = self.manager.live_txt_indices
-            if self.manager.live_indices() is not None:
+            if idx is not None:
                 img = img[..., img_idx, :]
                 txt = txt[..., txt_idx, :]
 
@@ -234,6 +248,10 @@ class DoubleStreamBlockWrapper(nn.Module):
         txt_q, txt_k = self.block.txt_attn.norm(txt_q, txt_k, txt_v)
 
         # RAS: KV Cache and Attention Call
+        # select part of the PE
+        if idx is not None:
+            pe = pe[:, :, idx]
+
         # create queries, keys, and values
         if self.block.flipped_img_txt:
             queries = apply_pe(torch.cat((img_q, txt_q), dim=2), pe)
@@ -245,16 +263,12 @@ class DoubleStreamBlockWrapper(nn.Module):
             values = torch.cat((txt_v, img_v), dim=2)
 
         # fill in the KV cache
-        if self.manager.live_indices() is None:
+        if idx is None:
             self.k_cache = keys
             self.v_cache = values
         else:
-            self.k_cache[
-                ..., self.manager.live_indices(self.block.flipped_img_txt), :
-            ] = keys
-            self.v_cache[
-                ..., self.manager.live_indices(self.block.flipped_img_txt), :
-            ] = values
+            self.k_cache[..., idx, :] = keys
+            self.v_cache[..., idx, :] = values
         # actual attention call
         attn = optimized_attention(
             queries,
@@ -294,12 +308,14 @@ class SingleStreamBlockWrapper(nn.Module):
     """
 
     def __init__(self, original: SingleStreamBlock, manager: RASManager):
+        super().__init__()
         self.block = original
         self.manager = manager
         self.k_cache: torch.Tensor
         self.v_cache: torch.Tensor
 
     def forward(self, x, vec, pe, attn_mask=None):
+        idx = self.manager.live_indices()
         mod, _ = self.block.modulation(vec)
         qkv, mlp = torch.split(
             self.block.linear1((1 + mod.scale) * self.block.pre_norm(x) + mod.shift),
@@ -313,16 +329,18 @@ class SingleStreamBlockWrapper(nn.Module):
         q, k = self.block.norm(q, k, v)
 
         # RAS: KV Cache
+        if idx is not None:
+            pe = pe[:, :, idx]
         q = apply_pe(q, pe)
         k = apply_pe(k, pe)
         # full hydrate
-        if self.manager.live_indices() is None:
+        if idx is None:
             self.k_cache = k
             self.v_cache = v
         # partial update
         else:
-            self.k_cache[..., self.manager.live_indices(), :] = k
-            self.v_cache[..., self.manager.live_indices(), :] = v
+            self.k_cache[..., idx, :] = k
+            self.v_cache[..., idx, :] = v
         attn = optimized_attention(
             q,
             self.k_cache,
