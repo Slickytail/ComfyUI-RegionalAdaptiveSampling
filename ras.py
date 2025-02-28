@@ -62,20 +62,18 @@ class RASManager:
         ), "High ratio should be in the range of [0, 1]"
 
     def wrap_layer(
-        self, layer: DoubleStreamBlock | SingleStreamBlock | LastLayer, first=False
+        self, layer: DoubleStreamBlock | SingleStreamBlock, first_or_last=False
     ):
         if isinstance(
             layer,
-            (DoubleStreamBlockWrapper, SingleStreamBlockWrapper, LastLayerWrapper),
+            (DoubleStreamBlockWrapper, SingleStreamBlockWrapper),
         ):
             raise TypeError("Old wrapping wasn't removed!")
 
         if isinstance(layer, DoubleStreamBlock):
-            wrapped = DoubleStreamBlockWrapper(layer, self, first)
+            wrapped = DoubleStreamBlockWrapper(layer, self, first_or_last)
         elif isinstance(layer, SingleStreamBlock):
-            wrapped = SingleStreamBlockWrapper(layer, self)
-        elif isinstance(layer, LastLayer):
-            wrapped = LastLayerWrapper(layer, self)
+            wrapped = SingleStreamBlockWrapper(layer, self, first_or_last)
         else:
             raise TypeError(f"Can't wrap layer of type {layer.__class__.__name__}")
         return wrapped
@@ -91,15 +89,18 @@ class RASManager:
             raise TypeError(f"Can't wrap model of type {model.__class__.__name__}")
         # wrap the single and double blocks to have caching
         for i, v in enumerate(model.double_blocks):
+            # first block has the special responsibility of removing tokens
             if i == 0:
                 self.flipped_img_txt = v.flipped_img_txt
-                layer = self.wrap_layer(v, first=True)
+                layer = self.wrap_layer(v, first_or_last=True)
             else:
                 layer = self.wrap_layer(v)
             patcher.add_object_patch(f"diffusion_model.double_blocks.{i}", layer)
         for i, v in enumerate(model.single_blocks):
+            # last block will put them back
             patcher.add_object_patch(
-                f"diffusion_model.single_blocks.{i}", self.wrap_layer(v)
+                f"diffusion_model.single_blocks.{i}",
+                self.wrap_layer(v, i == (len(model.single_blocks) - 1)),
             )
 
         # wrap the forward_orig method, to be able to get the timestep
@@ -121,11 +122,6 @@ class RASManager:
             "diffusion_model.forward_orig", MethodType(new_forward, model)
         )
 
-        # wrap the last_layer, to be able to read the output, and replace the missing (cached) tokens
-        patcher.add_object_patch(
-            "diffusion_model.final_layer", self.wrap_layer(model.final_layer)
-        )
-
     @staticmethod
     def timestep_from_sigmas(sigmas: Tensor, sample_sigmas: Tensor):
         # we assume that one element of sample_sigmas is exactly equal to sigmas
@@ -144,6 +140,7 @@ class RASManager:
     def select_indices(self, diff: Tensor, timestep: int):
         if isinstance(self.model, Flux):
             # b (h w) (c ph pw) = model_out.shape
+            diff = diff[..., self.n_txt :, :]
             metric = rearrange(
                 diff,
                 "b s (c ph pw) -> b s ph pw c",
@@ -153,6 +150,7 @@ class RASManager:
             metric = torch.std(metric, dim=-1).mean((-1, -2))
         elif isinstance(self.model, HunyuanVideo):
             # b (h w) (c ph pw) = model_out.shape
+            diff = diff[..., : self.n_img, :]
             metric = rearrange(
                 diff,
                 "b s (c pt ph pw ) -> b s pt ph pw c",
@@ -201,29 +199,6 @@ class RASManager:
             return torch.cat(
                 (self.live_txt_indices, self.live_img_indices + self.n_txt)
             )
-
-
-class LastLayerWrapper(LastLayer):
-    """
-    Same as the LastLayer, but reports its output to a manager.
-    """
-
-    def __init__(self, original: LastLayer, manager: RASManager):
-        nn.Module.__init__(self)
-        take_attributes_from(
-            original, self, ["norm_final", "linear", "adaLN_modulation"]
-        )
-        self.manager = manager
-
-    def forward(self, x, vec) -> Tensor:
-        output = super().forward(x, vec)
-        # if we were fully hydrating, fill the cache
-        if self.manager.live_indices() is None or self.manager.cached_output is None:
-            self.manager.cached_output = output.clone()
-        else:
-            self.manager.cached_output[..., self.manager.live_img_indices, :] = output
-        self.manager.select_indices(self.manager.cached_output, self.manager.timestep)
-        return self.manager.cached_output
 
 
 class DoubleStreamBlockWrapper(DoubleStreamBlock):
@@ -351,7 +326,7 @@ class SingleStreamBlockWrapper(SingleStreamBlock):
     Same as the SingleStreamBlock, but uses a RASManager and RASCache to do KV caching.
     """
 
-    def __init__(self, original: SingleStreamBlock, manager: RASManager):
+    def __init__(self, original: SingleStreamBlock, manager: RASManager, last=False):
         nn.Module.__init__(self)
         # steal all the attributes from the SingleStreamBlock
         take_attributes_from(
@@ -374,6 +349,7 @@ class SingleStreamBlockWrapper(SingleStreamBlock):
         self.manager = manager
         self.k_cache: torch.Tensor
         self.v_cache: torch.Tensor
+        self.last = last
 
     def forward(self, x, vec, pe, attn_mask=None):
         idx = self.manager.live_indices()
@@ -416,4 +392,14 @@ class SingleStreamBlockWrapper(SingleStreamBlock):
         x += mod.gate * output
         if x.dtype == torch.float16:
             x = torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
+
+        if self.last:
+            if idx is None or self.manager.cached_output is None:
+                self.manager.cached_output = x.clone()
+            else:
+                self.manager.cached_output[..., idx, :] = x
+            self.manager.select_indices(
+                self.manager.cached_output, self.manager.timestep
+            )
+            return self.manager.cached_output
         return x
