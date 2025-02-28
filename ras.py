@@ -62,11 +62,13 @@ class RASManager:
         ), "High ratio should be in the range of [0, 1]"
 
     def wrap_layer(
-        self, layer: DoubleStreamBlock | SingleStreamBlock, first_or_last=False
+        self,
+        layer: DoubleStreamBlock | SingleStreamBlock | LastLayer,
+        first_or_last=False,
     ):
         if isinstance(
             layer,
-            (DoubleStreamBlockWrapper, SingleStreamBlockWrapper),
+            (DoubleStreamBlockWrapper, SingleStreamBlockWrapper, LastLayerWrapper),
         ):
             raise TypeError("Old wrapping wasn't removed!")
 
@@ -74,6 +76,8 @@ class RASManager:
             wrapped = DoubleStreamBlockWrapper(layer, self, first_or_last)
         elif isinstance(layer, SingleStreamBlock):
             wrapped = SingleStreamBlockWrapper(layer, self, first_or_last)
+        elif isinstance(layer, LastLayer):
+            wrapped = LastLayerWrapper(layer, self)
         else:
             raise TypeError(f"Can't wrap layer of type {layer.__class__.__name__}")
         return wrapped
@@ -121,6 +125,10 @@ class RASManager:
         patcher.add_object_patch(
             "diffusion_model.forward_orig", MethodType(new_forward, model)
         )
+        # wrap the last_layer, to be able to read the output and calculate the metric
+        patcher.add_object_patch(
+            "diffusion_model.final_layer", self.wrap_layer(model.final_layer)
+        )
 
     @staticmethod
     def timestep_from_sigmas(sigmas: Tensor, sample_sigmas: Tensor):
@@ -143,7 +151,6 @@ class RASManager:
     def select_indices(self, diff: Tensor, timestep: int):
         if isinstance(self.model, Flux):
             # b (h w) (c ph pw) = model_out.shape
-            diff = diff[..., self.n_txt :, :]
             metric = rearrange(
                 diff,
                 "b s (c ph pw) -> b s ph pw c",
@@ -153,7 +160,6 @@ class RASManager:
             metric = torch.std(metric, dim=-1).mean((-1, -2))
         elif isinstance(self.model, HunyuanVideo):
             # b (h w) (c ph pw) = model_out.shape
-            diff = diff[..., : self.n_img, :]
             metric = rearrange(
                 diff,
                 "b s (c pt ph pw ) -> b s pt ph pw c",
@@ -397,12 +403,28 @@ class SingleStreamBlockWrapper(SingleStreamBlock):
             x = torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
 
         if self.last:
+            # put the relevant tokens back into the cached output
             if idx is None or self.manager.cached_output is None:
                 self.manager.cached_output = x.clone()
             else:
                 self.manager.cached_output[..., idx, :] = x
-            self.manager.select_indices(
-                self.manager.cached_output, self.manager.timestep
-            )
             return self.manager.cached_output
         return x
+
+
+class LastLayerWrapper(LastLayer):
+    """
+    Same as the LastLayer, but reports its output to a manager.
+    """
+
+    def __init__(self, original: LastLayer, manager: RASManager):
+        nn.Module.__init__(self)
+        take_attributes_from(
+            original, self, ["norm_final", "linear", "adaLN_modulation"]
+        )
+        self.manager = manager
+
+    def forward(self, x, vec) -> Tensor:
+        output = super().forward(x, vec)
+        self.manager.select_indices(output, self.manager.timestep)
+        return output
