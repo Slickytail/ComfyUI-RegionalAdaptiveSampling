@@ -1,4 +1,4 @@
-# RegionalAdaptiveSampling
+# Regional Adaptive Sampling
 
 [Regional Adaptive Sampling](https://github.com/microsoft/RAS) is a new technique for accelerating the inference of diffusion transformers. 
 It essentially works as a KV Cache inside the model, picking regions that are likely to be updated by each diffusion step and passing in only those tokens.
