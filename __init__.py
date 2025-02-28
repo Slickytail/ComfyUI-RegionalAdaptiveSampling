@@ -1,4 +1,5 @@
 from .ras import RASConfig, RASManager
+from comfy.model_patcher import ModelPatcher
 
 
 class RegionalAdaptiveSampling:
@@ -18,12 +19,15 @@ class RegionalAdaptiveSampling:
     FUNCTION = "apply_ras"
     CATEGORY = "ras"
 
-    def apply_ras(self, model, sample_ratio):
+    def apply_ras(self, model: ModelPatcher, sample_ratio: float):
         model = model.clone()
+        # unpatch the model
+        # this makes sure that we're wrapping the model "in a pure state"
+        # the model will repatch itself later
+        model.unpatch_model()
         config = RASConfig(sample_ratio=sample_ratio)
         manager = RASManager(config)
-        # todo: improve this, because this is a godawful way to go about it
-        manager.wrap_model(model.model.diffusion_model)
+        manager.wrap_model(model)
         return (model,)
 
 
