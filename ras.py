@@ -33,7 +33,7 @@ def take_attributes_from(source, target, keys):
 
 @dataclass
 class RASConfig:
-    start_step: int = 4
+    warmup_steps: int = 4
     hydrate_every: int = 5
     sample_ratio: float = 0.5
     starvation_scale: float = 0.1
@@ -131,10 +131,13 @@ class RASManager:
         return int(i.item())
 
     def skip_ratio(self, timestep: int) -> float:
-        if timestep < self.config.start_step or (
-            timestep % self.config.hydrate_every == 0
-        ):
-            return 1
+        if timestep < self.config.warmup_steps:
+            return 0
+        if self.config.hydrate_every:
+            if (
+                1 + timestep - self.config.warmup_steps
+            ) % self.config.hydrate_every == 0:
+                return 0
         return 1.0 - self.config.sample_ratio
 
     def select_indices(self, diff: Tensor, timestep: int):
@@ -172,7 +175,7 @@ class RASManager:
         metric *= torch.exp(self.config.starvation_scale * self.drop_count)
         indices = torch.sort(metric, dim=-1, descending=False).indices
         skip_ratio = self.skip_ratio(timestep)
-        if skip_ratio >= 0.99:
+        if skip_ratio <= 0.01:
             # we're not dropping anything -- remove the live_indices
             # we use the value None to indicate a full hydrate
             self.live_img_indices = None
