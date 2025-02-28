@@ -1,0 +1,16 @@
+[project]
+name = "comfyui-regional-adaptive-sampling
+description = "ComfyUI implementation of [Regional Adaptive Sampling](https://github.com/microsoft/RAS)."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["torch", "einops", "diffusers"]
+
+[project.urls]
+Repository = "https://github.com/Slickytail/ComfyUI-RegionalAdaptiveSampling
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "slickytail"
+DisplayName = "ComfyUI-RegionalAdaptiveSampling"
+Icon = ""
+
