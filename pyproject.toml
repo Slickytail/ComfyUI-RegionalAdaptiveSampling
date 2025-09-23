@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-regional-adaptive-sampling"
 description = "ComfyUI implementation of Regional Adaptive Sampling, (original implementation at https://github.com/microsoft/RAS)."
-version = "1.0.0"
+version = "1.1.0"
 license = {file = "LICENSE"}
 dependencies = ["torch", "einops", "diffusers"]
 

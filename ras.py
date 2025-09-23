@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from types import MethodType
-from time import sleep
 
 import torch
 from torch import nn
@@ -92,10 +91,12 @@ class RASManager:
             wrapped = SingleStreamBlockWrapper(layer, self, last)
         elif isinstance(layer, LastLayer):
             wrapped = LastLayerWrapper(layer, self)
-        elif isinstance(layer, WanAttentionBlock):
-            wrapped = WanAttentionBlockWrapper(layer, self, first, last)
+        # note: vacewaneattentionblock is a subclass of wanattentionblock
+        # so we have to check for the vace block first
         elif isinstance(layer, VaceWanAttentionBlock):
             wrapped = VaceWanAttentionBlockWrapper(layer, self, first, last)
+        elif isinstance(layer, WanAttentionBlock):
+            wrapped = WanAttentionBlockWrapper(layer, self, first, last)
         elif isinstance(layer, Head):
             wrapped = HeadWrapper(layer, self)
         else:
@@ -144,6 +145,19 @@ class RASManager:
                     v, first=(i == 0), last=(i == (len(model.blocks) - 1))
                 )
                 patcher.add_object_patch(f"diffusion_model.blocks.{i}", layer)
+
+            # todo, add the vace blocks as well here
+            if hasattr(model, "vace_blocks"):
+                for i, v in enumerate(model.vace_blocks):
+                    layer = self.wrap_layer(
+                        v,
+                        first=(i == 0),
+                        # we DONT put back the conditioning tokens
+                        # because the last vace block is well before the last real block
+                        last=False,
+                        # last=(i == (len(model.vace_blocks) - 1))
+                    )
+                    patcher.add_object_patch(f"diffusion_model.vace_blocks.{i}", layer)
 
         # wrap the forward_orig method, to be able to get the timestep
         forward_orig = model.forward_orig
@@ -641,13 +655,17 @@ class WanAttentionBlockWrapper(WanAttentionBlock):
         return x
 
 
-class VaceWanAttentionBlockWrapper(VaceWanAttentionBlock):
+class VaceWanAttentionBlockWrapper(WanAttentionBlockWrapper):
     """
     Same as the VaceWanAttentionBlock, but uses a RASManager and RASCache to do KV caching.
     """
 
     def __init__(
-        self, original: VaceWanAttentionBlock, manager: RASManager, first=False
+        self,
+        original: VaceWanAttentionBlock,
+        manager: RASManager,
+        first=False,
+        last=False,
     ):
         nn.Module.__init__(self)
         # Copy attributes, handling the case where some might not exist
@@ -668,144 +686,25 @@ class VaceWanAttentionBlockWrapper(VaceWanAttentionBlock):
             "ffn",
             "modulation",
         ]
-
         # Handle optional attributes that might not exist
-        optional_attributes = ["before_proj", "after_proj"]
-
         take_attributes_from(original, self, attributes_to_copy)
 
         # Copy optional attributes if they exist
-        for attr in optional_attributes:
+        for attr in ["before_proj", "after_proj"]:
             if hasattr(original, attr):
                 setattr(self, attr, getattr(original, attr))
         self.manager = manager
         self.k_cache: torch.Tensor
         self.v_cache: torch.Tensor
         self.first = first
+        self.last = last
 
-    def forward(
-        self, c, x, e, freqs, context, context_img_len=257, transformer_options={}
-    ):
-        # RAS: if this is the first block, then we should drop some tokens
-        idx = self.manager.live_indices()
-        if self.first:
-            # For VaceWan models, we track the sequence length differently
-            self.manager.n_txt = (
-                0  # Wan doesn't have separate text tokens in the same way
-            )
-            # TODO: get vace working
-            self.manager.n_img = c.shape[1]
-
-            if idx is not None:
-                c = c[..., idx, :]
-
-        # VaceWan specific logic (copied from original)
-        if self.block_id == 0 and hasattr(self, "before_proj"):
+    def forward(self, c, x, **kwargs):
+        if hasattr(self, "before_proj"):
             c = self.before_proj(c) + x
-
-        # Call the parent WanAttentionBlock logic but with our modified attention
-        # Modulation handling (copied from original)
-        if e.ndim < 4:
-            e = (
-                comfy.model_management.cast_to(
-                    self.modulation, dtype=c.dtype, device=c.device
-                )
-                + e
-            ).chunk(6, dim=1)
-        else:
-            e = (
-                comfy.model_management.cast_to(
-                    self.modulation, dtype=c.dtype, device=c.device
-                ).unsqueeze(0)
-                + e
-            ).unbind(2)
-
-        # Self-attention with RAS caching
-        y = self.self_attn_with_cache(
-            torch.addcmul(
-                self.repeat_e(e[0], c), self.norm1(c), 1 + self.repeat_e(e[1], c)
-            ),
-            freqs,
-            idx,
-            transformer_options=transformer_options,
-        )
-
-        c = torch.addcmul(c, y, self.repeat_e(e[2], c))
-
-        # Cross-attention & ffn (unchanged from original)
-        c = c + self.cross_attn(
-            self.norm3(c),
-            context,
-            context_img_len=context_img_len,
-            transformer_options=transformer_options,
-        )
-        y = self.ffn(
-            torch.addcmul(
-                self.repeat_e(e[3], c), self.norm2(c), 1 + self.repeat_e(e[4], c)
-            )
-        )
-        c = torch.addcmul(c, y, self.repeat_e(e[5], c))
-
-        # VaceWan specific projection
+        c = super().forward(c, **kwargs)
         c_skip = self.after_proj(c)
         return c_skip, c
-
-    def repeat_e(self, e, x):
-        """Helper function for modulation broadcasting"""
-        repeats = 1
-        if e.size(1) > 1:
-            repeats = x.size(1) // e.size(1)
-        if repeats == 1:
-            return e
-        if repeats * e.size(1) == x.size(1):
-            return torch.repeat_interleave(e, repeats, dim=1)
-        else:
-            return torch.repeat_interleave(e, repeats + 1, dim=1)[:, : x.size(1)]
-
-    def self_attn_with_cache(self, x, freqs, idx, transformer_options={}):
-        """Modified self-attention that uses KV caching"""
-        # NOTE the following attention function doesn't work
-        # it's fucked
-        # needs to be replaced
-        # just use the one from wan (above)
-        b, s, n, d = *x.shape[:2], self.num_heads, x.shape[-1] // self.num_heads
-
-        # Compute QKV like original Wan self-attention
-        q = self.self_attn.norm_q(self.self_attn.q(x)).view(b, s, n, d)
-        k = self.self_attn.norm_k(self.self_attn.k(x)).view(b, s, n, d)
-        v = self.self_attn.v(x).view(b, s, n, d)
-
-        # Apply rope to Q and K
-        from comfy.ldm.flux.math import apply_rope1
-
-        if idx is not None:
-            freqs = freqs[:, idx]
-        q = apply_rope1(q, freqs)
-        k = apply_rope1(k, freqs)
-
-        # RAS: KV Cache management
-        if idx is None:
-            # Full hydrate - store the complete k,v tensors as cache
-            self.k_cache = k
-            self.v_cache = v
-        else:
-            self.k_cache[:, idx, :, :] = k
-            self.v_cache[:, idx, :, :] = v
-
-        q_flat = q.view(b, s, n * d)
-        k_flat = self.k_cache.view(b, self.k_cache.shape[1], n * d)
-        v_flat = self.v_cache.view(b, self.v_cache.shape[1], n * d)
-
-        attn = optimized_attention(
-            q_flat,
-            k_flat,
-            v_flat,
-            heads=n,
-            transformer_options=transformer_options,
-        )
-
-        result = self.self_attn.o(attn)
-        return result
 
 
 class HeadWrapper(Head):
