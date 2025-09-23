@@ -10,8 +10,20 @@ from einops import rearrange
 from comfy.ldm.flux.model import Flux
 from comfy.ldm.hunyuan_video.model import HunyuanVideo
 from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock, LastLayer
+from comfy.ldm.wan.model import (
+    WanModel,
+    VaceWanModel,
+    CameraWanModel,
+    WanModel_S2V,
+    HumoWanModel,
+    WanAttentionBlock,
+    VaceWanAttentionBlock,
+    Head,
+)
+from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.model_patcher import ModelPatcher
+import comfy.model_management
 
 
 def apply_pe(x: Tensor, pe: Tensor) -> Tensor:
@@ -61,23 +73,31 @@ class RASManager:
             self.config.high_ratio >= 0 and self.config.high_ratio <= 1
         ), "High ratio should be in the range of [0, 1]"
 
-    def wrap_layer(
-        self,
-        layer: DoubleStreamBlock | SingleStreamBlock | LastLayer,
-        first_or_last=False,
-    ):
+    def wrap_layer(self, layer, first: bool = False, last: bool = False):
         if isinstance(
             layer,
-            (DoubleStreamBlockWrapper, SingleStreamBlockWrapper, LastLayerWrapper),
+            (
+                DoubleStreamBlockWrapper,
+                SingleStreamBlockWrapper,
+                LastLayerWrapper,
+                WanAttentionBlockWrapper,
+                VaceWanAttentionBlockWrapper,
+            ),
         ):
             raise TypeError("Old wrapping wasn't removed!")
 
         if isinstance(layer, DoubleStreamBlock):
-            wrapped = DoubleStreamBlockWrapper(layer, self, first_or_last)
+            wrapped = DoubleStreamBlockWrapper(layer, self, first)
         elif isinstance(layer, SingleStreamBlock):
-            wrapped = SingleStreamBlockWrapper(layer, self, first_or_last)
+            wrapped = SingleStreamBlockWrapper(layer, self, last)
         elif isinstance(layer, LastLayer):
             wrapped = LastLayerWrapper(layer, self)
+        elif isinstance(layer, WanAttentionBlock):
+            wrapped = WanAttentionBlockWrapper(layer, self, first, last)
+        elif isinstance(layer, VaceWanAttentionBlock):
+            wrapped = VaceWanAttentionBlockWrapper(layer, self, first, last)
+        elif isinstance(layer, Head):
+            wrapped = HeadWrapper(layer, self)
         else:
             raise TypeError(f"Can't wrap layer of type {layer.__class__.__name__}")
         return wrapped
@@ -89,29 +109,52 @@ class RASManager:
             self.patch_size = [model.patch_size, model.patch_size]
         elif isinstance(model, HunyuanVideo):
             self.patch_size = model.patch_size
+        elif isinstance(
+            model, (WanModel, VaceWanModel, CameraWanModel, WanModel_S2V, HumoWanModel)
+        ):
+            self.patch_size = model.patch_size
         else:
             raise TypeError(f"Can't wrap model of type {model.__class__.__name__}")
-        # wrap the single and double blocks to have caching
-        for i, v in enumerate(model.double_blocks):
-            # first block has the special responsibility of removing tokens
-            if i == 0:
-                self.flipped_img_txt = v.flipped_img_txt
-                layer = self.wrap_layer(v, first_or_last=True)
-            else:
-                layer = self.wrap_layer(v)
-            patcher.add_object_patch(f"diffusion_model.double_blocks.{i}", layer)
-        for i, v in enumerate(model.single_blocks):
-            # last block will put them back
-            patcher.add_object_patch(
-                f"diffusion_model.single_blocks.{i}",
-                self.wrap_layer(v, i == (len(model.single_blocks) - 1)),
-            )
+        # Handle different model architectures
+        if isinstance(model, (Flux, HunyuanVideo)):
+            # wrap the single and double blocks to have caching
+            for i, v in enumerate(model.double_blocks):
+                # first block has the special responsibility of removing tokens
+                if i == 0:
+                    self.flipped_img_txt = v.flipped_img_txt
+                    layer = self.wrap_layer(v, first=True)
+                else:
+                    layer = self.wrap_layer(v)
+                patcher.add_object_patch(f"diffusion_model.double_blocks.{i}", layer)
+            for i, v in enumerate(model.single_blocks):
+                # last block will put them back
+                patcher.add_object_patch(
+                    f"diffusion_model.single_blocks.{i}",
+                    self.wrap_layer(v, last=(i == (len(model.single_blocks) - 1))),
+                )
+        elif isinstance(
+            model, (WanModel, VaceWanModel, CameraWanModel, WanModel_S2V, HumoWanModel)
+        ):
+            # Wan models have a different structure with just 'blocks'
+            self.flipped_img_txt = False  # Wan doesn't use the flipped pattern
+            for i, v in enumerate(model.blocks):
+                # first block has the special responsibility of removing tokens
+                # last block will put them back
+                layer = self.wrap_layer(
+                    v, first=(i == 0), last=(i == (len(model.blocks) - 1))
+                )
+                patcher.add_object_patch(f"diffusion_model.blocks.{i}", layer)
 
         # wrap the forward_orig method, to be able to get the timestep
         forward_orig = model.forward_orig
 
         def new_forward(_self, *args, **kwargs):
-            transformer_options = args[-1]
+            # Get transformer_options from kwargs for Wan models, or from args for Flux/Hunyuan
+            if "transformer_options" in kwargs:
+                transformer_options = kwargs["transformer_options"]
+            else:
+                transformer_options = args[-1]
+
             self.timestep = self.timestep_from_sigmas(
                 transformer_options["sigmas"], transformer_options["sample_sigmas"]
             )
@@ -126,9 +169,17 @@ class RASManager:
             "diffusion_model.forward_orig", MethodType(new_forward, model)
         )
         # wrap the last_layer, to be able to read the output and calculate the metric
-        patcher.add_object_patch(
-            "diffusion_model.final_layer", self.wrap_layer(model.final_layer)
-        )
+        if isinstance(model, (Flux, HunyuanVideo)):
+            patcher.add_object_patch(
+                "diffusion_model.final_layer", self.wrap_layer(model.final_layer)
+            )
+        elif isinstance(
+            model, (WanModel, VaceWanModel, CameraWanModel, WanModel_S2V, HumoWanModel)
+        ):
+            # Wan models use 'head' instead of 'final_layer'
+            patcher.add_object_patch(
+                "diffusion_model.head", self.wrap_layer(model.head)
+            )
 
     @staticmethod
     def timestep_from_sigmas(sigmas: Tensor, sample_sigmas: Tensor):
@@ -141,12 +192,14 @@ class RASManager:
     def skip_ratio(self, timestep: int) -> float:
         if timestep < self.config.warmup_steps:
             return 0
+
         if self.config.hydrate_every:
             if (
                 1 + timestep - self.config.warmup_steps
             ) % self.config.hydrate_every == 0:
                 return 0
-        return 1.0 - self.config.sample_ratio
+        result = 1.0 - self.config.sample_ratio
+        return result
 
     def select_indices(self, diff: Tensor, timestep: int):
         if isinstance(self.model, Flux):
@@ -158,8 +211,19 @@ class RASManager:
                 pw=self.patch_size[1],
             )
             metric = torch.std(metric, dim=-1).mean((-1, -2))
-        elif isinstance(self.model, HunyuanVideo):
+        elif isinstance(
+            self.model,
+            (
+                HunyuanVideo,
+                WanModel,
+                VaceWanModel,
+                CameraWanModel,
+                WanModel_S2V,
+                HumoWanModel,
+            ),
+        ):
             # b (h w) (c ph pw) = model_out.shape
+            # Both HunyuanVideo and Wan models are video models with 3D patches
             metric = rearrange(
                 diff,
                 "b s (c pt ph pw ) -> b s pt ph pw c",
@@ -170,8 +234,9 @@ class RASManager:
             metric = torch.std(metric, dim=-1).mean((-1, -2, -3))
         else:
             raise TypeError("Unknown latent type!")
-        # hmm, how do we deal with batch size != 1 here?
-        # that might be a problem
+        # for batch size > 1, we pick separate indices per batch
+        # for now, JUST FOR TESTING, we'll merge all the batches and use the indices that are the most relevant for all batches
+        metric = metric.mean(dim=0)
         metric = metric.flatten()
         if self.drop_count is None:
             self.drop_count = torch.zeros(
@@ -191,23 +256,26 @@ class RASManager:
             cache_indices = torch.cat([indices[:low_bar], indices[-high_bar:]])
             self.live_img_indices = indices[low_bar:-high_bar]
             self.drop_count[cache_indices] += 1
+
         # TODO: for now we keep all txt tokens
         # in the future, we can probably do something like randomly keep a fraction of them
-        self.live_txt_indices = torch.arange(
-            0, self.n_txt, dtype=torch.int, device=diff.device
-        )
+        if self.n_txt > 0:
+            self.live_txt_indices = torch.arange(
+                0, self.n_txt, dtype=torch.int, device=diff.device
+            )
 
     def live_indices(self):
         if self.live_img_indices is None or self.live_txt_indices is None:
-            return None
+            return self.live_img_indices
         if self.flipped_img_txt:
-            return torch.cat(
+            result = torch.cat(
                 (self.live_img_indices, self.live_txt_indices + self.n_img)
             )
         else:
-            return torch.cat(
+            result = torch.cat(
                 (self.live_txt_indices, self.live_img_indices + self.n_txt)
             )
+        return result
 
 
 class DoubleStreamBlockWrapper(DoubleStreamBlock):
@@ -426,5 +494,335 @@ class LastLayerWrapper(LastLayer):
 
     def forward(self, x, vec) -> Tensor:
         output = super().forward(x, vec)
+        self.manager.select_indices(output, self.manager.timestep)
+        return output
+
+
+class WanAttentionBlockWrapper(WanAttentionBlock):
+    """
+    Same as the WanAttentionBlock, but uses a RASManager and RASCache to do KV caching.
+    """
+
+    def __init__(self, original: WanAttentionBlock, manager: RASManager, first, last):
+        nn.Module.__init__(self)
+        take_attributes_from(
+            original,
+            self,
+            [
+                "dim",
+                "ffn_dim",
+                "num_heads",
+                "window_size",
+                "qk_norm",
+                "cross_attn_norm",
+                "eps",
+                "norm1",
+                "self_attn",
+                "norm3",
+                "cross_attn",
+                "norm2",
+                "ffn",
+                "modulation",
+            ],
+        )
+        self.manager = manager
+        self.k_cache: torch.Tensor
+        self.v_cache: torch.Tensor
+        self.first = first
+        self.last = last
+
+    def forward(
+        self, x, e, freqs, context, context_img_len=257, transformer_options={}
+    ):
+        # RAS: if this is the first block, then we should drop some tokens
+        idx = self.manager.live_indices()
+
+        if self.first:
+            # we just have img tokens
+            self.manager.n_txt = 0
+            self.manager.n_img = x.shape[1]
+            if idx is not None:
+                x = x[..., idx, :]
+
+        # Modulation handling (copied from original)
+        if e.ndim < 4:
+            e = (
+                comfy.model_management.cast_to(
+                    self.modulation, dtype=x.dtype, device=x.device
+                )
+                + e
+            ).chunk(6, dim=1)
+        else:
+            e = (
+                comfy.model_management.cast_to(
+                    self.modulation, dtype=x.dtype, device=x.device
+                ).unsqueeze(0)
+                + e
+            ).unbind(2)
+
+        # Self-attention with RAS caching
+        y = self.self_attn_with_cache(
+            torch.addcmul(
+                self.repeat_e(e[0], x), self.norm1(x), 1 + self.repeat_e(e[1], x)
+            ),
+            freqs,
+            idx,
+            transformer_options=transformer_options,
+        )
+
+        x = torch.addcmul(x, y, self.repeat_e(e[2], x))
+
+        # Cross-attention & ffn (unchanged from original)
+        x = x + self.cross_attn(
+            self.norm3(x),
+            context,
+            context_img_len=context_img_len,
+            transformer_options=transformer_options,
+        )
+        y = self.ffn(
+            torch.addcmul(
+                self.repeat_e(e[3], x), self.norm2(x), 1 + self.repeat_e(e[4], x)
+            )
+        )
+        x = torch.addcmul(x, y, self.repeat_e(e[5], x))
+
+        if self.last:
+            # put the relevant tokens back into the cached output
+            if idx is None or self.manager.cached_output is None:
+                self.manager.cached_output = x.clone()
+            else:
+                self.manager.cached_output[..., idx, :] = x
+            return self.manager.cached_output
+        return x
+
+    def repeat_e(self, e, x):
+        """Helper function for modulation broadcasting"""
+        repeats = 1
+        if e.size(1) > 1:
+            repeats = x.size(1) // e.size(1)
+        if repeats == 1:
+            return e
+        if repeats * e.size(1) == x.size(1):
+            return torch.repeat_interleave(e, repeats, dim=1)
+        else:
+            return torch.repeat_interleave(e, repeats + 1, dim=1)[:, : x.size(1)]
+
+    def self_attn_with_cache(self, x, freqs, idx, transformer_options={}):
+        """Modified self-attention that uses KV caching"""
+        b, s, n, d = *x.shape[:2], self.num_heads, self.self_attn.head_dim
+
+        # just pull out part of the frequencies
+        if idx is not None:
+            freqs = freqs[:, idx]
+
+        # Compute QKV like original Wan self-attention
+        q = self.self_attn.norm_q(self.self_attn.q(x)).view(b, s, n, d)
+        q = apply_rope1(q, freqs).view(b, s, n * d)
+        k = self.self_attn.norm_k(self.self_attn.k(x)).view(b, s, n, d)
+        k = apply_rope1(k, freqs).view(b, s, n * d)
+        v = self.self_attn.v(x).view(b, s, n * d)
+
+        # RAS: KV Cache management
+        if idx is None:
+            self.k_cache = k
+            self.v_cache = v
+        else:
+            self.k_cache[:, idx, :] = k
+            self.v_cache[:, idx, :] = v
+        x = optimized_attention(
+            q,
+            self.k_cache,
+            self.v_cache,
+            heads=n,
+            transformer_options=transformer_options,
+        )
+
+        x = self.self_attn.o(x)
+        return x
+
+
+class VaceWanAttentionBlockWrapper(VaceWanAttentionBlock):
+    """
+    Same as the VaceWanAttentionBlock, but uses a RASManager and RASCache to do KV caching.
+    """
+
+    def __init__(
+        self, original: VaceWanAttentionBlock, manager: RASManager, first=False
+    ):
+        nn.Module.__init__(self)
+        # Copy attributes, handling the case where some might not exist
+        attributes_to_copy = [
+            "dim",
+            "ffn_dim",
+            "num_heads",
+            "window_size",
+            "qk_norm",
+            "cross_attn_norm",
+            "eps",
+            "block_id",
+            "norm1",
+            "self_attn",
+            "norm3",
+            "cross_attn",
+            "norm2",
+            "ffn",
+            "modulation",
+        ]
+
+        # Handle optional attributes that might not exist
+        optional_attributes = ["before_proj", "after_proj"]
+
+        take_attributes_from(original, self, attributes_to_copy)
+
+        # Copy optional attributes if they exist
+        for attr in optional_attributes:
+            if hasattr(original, attr):
+                setattr(self, attr, getattr(original, attr))
+        self.manager = manager
+        self.k_cache: torch.Tensor
+        self.v_cache: torch.Tensor
+        self.first = first
+
+    def forward(
+        self, c, x, e, freqs, context, context_img_len=257, transformer_options={}
+    ):
+        # RAS: if this is the first block, then we should drop some tokens
+        idx = self.manager.live_indices()
+        if self.first:
+            # For VaceWan models, we track the sequence length differently
+            self.manager.n_txt = (
+                0  # Wan doesn't have separate text tokens in the same way
+            )
+            # TODO: get vace working
+            self.manager.n_img = c.shape[1]
+
+            if idx is not None:
+                c = c[..., idx, :]
+
+        # VaceWan specific logic (copied from original)
+        if self.block_id == 0 and hasattr(self, "before_proj"):
+            c = self.before_proj(c) + x
+
+        # Call the parent WanAttentionBlock logic but with our modified attention
+        # Modulation handling (copied from original)
+        if e.ndim < 4:
+            e = (
+                comfy.model_management.cast_to(
+                    self.modulation, dtype=c.dtype, device=c.device
+                )
+                + e
+            ).chunk(6, dim=1)
+        else:
+            e = (
+                comfy.model_management.cast_to(
+                    self.modulation, dtype=c.dtype, device=c.device
+                ).unsqueeze(0)
+                + e
+            ).unbind(2)
+
+        # Self-attention with RAS caching
+        y = self.self_attn_with_cache(
+            torch.addcmul(
+                self.repeat_e(e[0], c), self.norm1(c), 1 + self.repeat_e(e[1], c)
+            ),
+            freqs,
+            idx,
+            transformer_options=transformer_options,
+        )
+
+        c = torch.addcmul(c, y, self.repeat_e(e[2], c))
+
+        # Cross-attention & ffn (unchanged from original)
+        c = c + self.cross_attn(
+            self.norm3(c),
+            context,
+            context_img_len=context_img_len,
+            transformer_options=transformer_options,
+        )
+        y = self.ffn(
+            torch.addcmul(
+                self.repeat_e(e[3], c), self.norm2(c), 1 + self.repeat_e(e[4], c)
+            )
+        )
+        c = torch.addcmul(c, y, self.repeat_e(e[5], c))
+
+        # VaceWan specific projection
+        c_skip = self.after_proj(c)
+        return c_skip, c
+
+    def repeat_e(self, e, x):
+        """Helper function for modulation broadcasting"""
+        repeats = 1
+        if e.size(1) > 1:
+            repeats = x.size(1) // e.size(1)
+        if repeats == 1:
+            return e
+        if repeats * e.size(1) == x.size(1):
+            return torch.repeat_interleave(e, repeats, dim=1)
+        else:
+            return torch.repeat_interleave(e, repeats + 1, dim=1)[:, : x.size(1)]
+
+    def self_attn_with_cache(self, x, freqs, idx, transformer_options={}):
+        """Modified self-attention that uses KV caching"""
+        # NOTE the following attention function doesn't work
+        # it's fucked
+        # needs to be replaced
+        # just use the one from wan (above)
+        b, s, n, d = *x.shape[:2], self.num_heads, x.shape[-1] // self.num_heads
+
+        # Compute QKV like original Wan self-attention
+        q = self.self_attn.norm_q(self.self_attn.q(x)).view(b, s, n, d)
+        k = self.self_attn.norm_k(self.self_attn.k(x)).view(b, s, n, d)
+        v = self.self_attn.v(x).view(b, s, n, d)
+
+        # Apply rope to Q and K
+        from comfy.ldm.flux.math import apply_rope1
+
+        if idx is not None:
+            freqs = freqs[:, idx]
+        q = apply_rope1(q, freqs)
+        k = apply_rope1(k, freqs)
+
+        # RAS: KV Cache management
+        if idx is None:
+            # Full hydrate - store the complete k,v tensors as cache
+            self.k_cache = k
+            self.v_cache = v
+        else:
+            self.k_cache[:, idx, :, :] = k
+            self.v_cache[:, idx, :, :] = v
+
+        q_flat = q.view(b, s, n * d)
+        k_flat = self.k_cache.view(b, self.k_cache.shape[1], n * d)
+        v_flat = self.v_cache.view(b, self.v_cache.shape[1], n * d)
+
+        attn = optimized_attention(
+            q_flat,
+            k_flat,
+            v_flat,
+            heads=n,
+            transformer_options=transformer_options,
+        )
+
+        result = self.self_attn.o(attn)
+        return result
+
+
+class HeadWrapper(Head):
+    """
+    Same as the Head (Wan final layer), but reports its output to a manager.
+    """
+
+    def __init__(self, original: Head, manager: RASManager):
+        nn.Module.__init__(self)
+        take_attributes_from(
+            original,
+            self,
+            ["dim", "out_dim", "patch_size", "eps", "norm", "head", "modulation"],
+        )
+        self.manager = manager
+
+    def forward(self, x, e) -> Tensor:
+        output = super().forward(x, e)
         self.manager.select_indices(output, self.manager.timestep)
         return output
