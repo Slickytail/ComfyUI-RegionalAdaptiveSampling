@@ -1,6 +1,6 @@
 # Regional Adaptive Sampling
 
-*** Version 1.1.0***: Support for Wan/VACE.  
+***Version 1.1.0***: Support for Wan/VACE.  
 It's currently experimental status. I tested with Wan2.1 Vace 1.3B T2I and Wan2.2 T2I 5B. 
 Please feel free to open an issue if your wan workflow doesn't work (there are a lot of Wan variants, and I might not have handled all cases correctly).
 
@@ -17,4 +17,4 @@ Apply the `Regional Adaptive Sampling` node to the desired model. It has the fol
 - **starvation_scale**: Controls how the model decides which part of the image to focus on. Increasing it will probably shift quality from the main subject to the background. The default of 0.1 is what's used in the paper, and I haven't tried anything else.
 
 ## Todos:
-support batch size > 1 or cfg (makes the token caching logic more complicated)
+support batch size > 1 or cfg (makes the token caching logic more complicated). this will probably not be implemented, because sometimes depending on VRAM comfy will split batches up in different ways for different calls.
